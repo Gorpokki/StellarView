@@ -95,7 +95,7 @@ jobs:
           crashes=$(ls client/crash-reports/*.txt 2>/dev/null || true)
           if [ -n "$crashes" ]; then
             echo 'The client wrote a crash report:'
-            cat $crashes
+            cat client/crash-reports/*.txt
             exit 1
           fi
           # The mod's constructor registers a client config, so the file exists only when the jar was discovered and loaded.
