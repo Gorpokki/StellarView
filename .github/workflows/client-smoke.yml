@@ -1,0 +1,124 @@
+name: client-smoke
+
+# Linux only: builds the mod jar and starts a headless client with it.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: client-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  client:
+    name: Build the jar and start the client with it
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The HeadlessMC 2.10.0 image (https://hub.docker.com/r/3arthqu4ke/headlessmc) holds the launcher in /headlessmc.
+    container:
+      image: 3arthqu4ke/headlessmc:2.10.0@sha256:4886bc1bc2247dab7161eb6da8cbd74b7144a4cfd207fab574f1a561f674a09b
+    defaults:
+      run:
+        shell: bash
+    env:
+      NEOFORGE: 21.1.72
+      NEOFORGE_SHA256: 6ccef0bf6e76efb84d6c215a2ec4624e6e70a5325e78171440b50d2b0a76d28c
+      # mc-runtime-test opens a new single-player world, waits for the player's chunk and 100 ticks, then quits.
+      MCRT_URL: https://github.com/headlesshq/mc-runtime-test/releases/download/4.5.1/mc-runtime-test-1.21.1-4.5.1-neoforge-release.jar
+      MCRT_SHA256: 404e566645730470dc873db88c28d483995c9b7bb6999a6a2af9630a41bf7774
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Build the jar
+        run: ./gradlew --no-daemon build
+      - name: Install a NeoForge client with mc-runtime-test and the mod jar
+        run: |
+          # The client renders to Xvfb with Mesa software GL instead of the HeadlessMC -lwjgl no-op patch,
+          # which reports 0 vertex attributes and breaks renderers that ask the driver for its limits.
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends procps xvfb xauth x11-xserver-utils \
+            libgl1 libglx-mesa0 libgl1-mesa-dri libxcursor1 libxrandr2 libxi6 libxxf86vm1 libxtst6 > /dev/null
+          mc="$RUNNER_TEMP/minecraft"
+          mkdir -p "$RUNNER_TEMP/dl" "$mc" client/mods
+          cd "$RUNNER_TEMP/dl"
+          curl -fsSLo neoforge-installer.jar "https://maven.neoforged.net/releases/net/neoforged/neoforge/$NEOFORGE/neoforge-$NEOFORGE-installer.jar"
+          curl -fsSLo mc-runtime-test.jar "$MCRT_URL"
+          echo "$NEOFORGE_SHA256  neoforge-installer.jar" | sha256sum -c
+          echo "$MCRT_SHA256  mc-runtime-test.jar" | sha256sum -c
+          # The installer refuses a directory without a launcher profile file.
+          echo '{"profiles":{}}' > "$mc/launcher_profiles.json"
+          java -jar neoforge-installer.jar --installClient "$mc"
+          cd "$GITHUB_WORKSPACE"
+          cp "$RUNNER_TEMP/dl/mc-runtime-test.jar" client/mods/
+          cp build/libs/*-1.21.1-*-NeoForge.jar client/mods/
+          printf '%s\n' 'onboardAccessibility:false' 'pauseOnLostFocus:false' > client/options.txt
+          # FML 4.0.43 reloads fml.toml during mod discovery while the early loading screen thread reads it, so the screen can
+          # read a half-loaded config and throw a NullPointerException. The smoke test needs no loading screen, so turn it off.
+          mkdir -p client/config
+          echo 'earlyWindowControl = false' > client/config/fml.toml
+          mkdir -p HeadlessMC
+          printf '%s\n' \
+            "hmc.java.versions=$JAVA_HOME_21_X64/bin/java" \
+            'hmc.java.use.current=false' \
+            'hmc.auto.download.java=false' \
+            "hmc.gamedir=$GITHUB_WORKSPACE/client" \
+            "hmc.mcdir=$mc" \
+            'hmc.offline=true' \
+            'hmc.assets.dummy=true' \
+            'hmc.rethrow.launch.exceptions=true' \
+            'hmc.exit.on.failed.command=true' \
+            'hmc.jvmargs=-Xmx3G -Dmixin.debug.verify=true -Dmixin.debug.export=true -DMcRuntimeGameTest=false' \
+            > HeadlessMC/config.properties
+      # The jar is in the mods folder before the client starts, so a crash on mod load or on the first sky frame fails here.
+      - name: Start the client, open a single-player world, then quit
+        timeout-minutes: 20
+        run: |
+          JAVA_HOME="$JAVA_HOME_21_X64" xvfb-run -a "$JAVA_HOME_21_X64/bin/java" -Dhmc.check.xvfb=true -jar /headlessmc/headlessmc-launcher-*.jar \
+            --command launch "neoforge-$NEOFORGE" 2>&1 | tee client.log
+      - name: Check the client log
+        run: |
+          grep -m1 -F 'java version 21' client.log
+          if grep -nE 'Mixin apply .*failed|InvalidMixinException|MixinApplyError|Mixin transformation of .* failed' client.log; then
+            echo 'A mixin failed to apply (lines above).'
+            exit 1
+          fi
+          crashes=$(ls client/crash-reports/*.txt 2>/dev/null || true)
+          if [ -n "$crashes" ]; then
+            echo 'The client wrote a crash report:'
+            cat client/crash-reports/*.txt
+            exit 1
+          fi
+          # The mod's constructor registers a client config, so the file exists only when the jar was discovered and loaded.
+          test -f client/config/stellarview-client.toml || { echo 'The mod config was never written, so the jar was not loaded.'; exit 1; }
+          grep -F 'Successfully finished.' client.log
+      # Runs even when an earlier step failed or timed out, so no game or X server outlives the job.
+      # The [x] brackets keep pkill from matching this step's own command line.
+      - name: Kill leftover game processes
+        if: ${{ always() }}
+        run: pkill -f '[h]eadlessmc|[X]vfb|[n]et.minecraft' || true
+      - name: Upload the jar
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mod-jar
+          if-no-files-found: error
+          path: build/libs/*-1.21.1-*-NeoForge.jar
+      - name: Keep the client log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: client-smoke
+          retention-days: 7
+          path: |
+            client.log
+            client/logs/
+            client/crash-reports/
