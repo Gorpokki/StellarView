@@ -1,0 +1,65 @@
+name: client-smoke
+
+# Linux only: builds the mod jar and starts a headless client with it.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: client-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  client:
+    name: Build the jar and start the client with it
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The HeadlessMC 2.10.0 image (https://hub.docker.com/r/3arthqu4ke/headlessmc) holds the launcher in /headlessmc.
+    # A composite action cannot set a job container, so the pinned image stays here.
+    container:
+      image: 3arthqu4ke/headlessmc:2.10.0@sha256:4886bc1bc2247dab7161eb6da8cbd74b7144a4cfd207fab574f1a561f674a09b
+    defaults:
+      run:
+        shell: bash
+    env:
+      NEOFORGE: 21.1.72
+      NEOFORGE_SHA256: 6ccef0bf6e76efb84d6c215a2ec4624e6e70a5325e78171440b50d2b0a76d28c
+      # mc-runtime-test opens a new single-player world, waits for the player's chunk and 100 ticks, then quits.
+      MCRT_URL: https://github.com/headlesshq/mc-runtime-test/releases/download/4.5.1/mc-runtime-test-1.21.1-4.5.1-neoforge-release.jar
+      MCRT_SHA256: 404e566645730470dc873db88c28d483995c9b7bb6999a6a2af9630a41bf7774
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Build the jar
+        run: ./gradlew --no-daemon build
+      - name: Client smoke
+        uses: ./.github/actions/client-smoke
+        timeout-minutes: 20
+        with:
+          mod-jar: build/libs/*-1.21.1-*-NeoForge.jar
+      - name: Upload the jar
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mod-jar
+          if-no-files-found: error
+          path: build/libs/*-1.21.1-*-NeoForge.jar
+      - name: Keep the client log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: client-smoke
+          retention-days: 7
+          path: |
+            client.log
+            client/logs/
+            client/crash-reports/

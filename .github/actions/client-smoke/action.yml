@@ -1,0 +1,84 @@
+name: Client smoke
+description: Start a headless NeoForge client with the mod jar under test, open a single-player world, quit, and check the log.
+# Composite action docs: https://docs.github.com/en/actions/tutorials/create-actions/create-a-composite-action
+# The caller job must run in the pinned HeadlessMC container (a composite cannot set a job container),
+# check out the repository, and install JDK 21. The caller job env must hold NEOFORGE, NEOFORGE_SHA256,
+# MCRT_URL and MCRT_SHA256.
+inputs:
+  mod-jar:
+    description: Glob of the mod jar under test, relative to the workspace.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Install a NeoForge client with mc-runtime-test and the mod jar
+      shell: bash
+      env:
+        MOD_JAR: ${{ inputs.mod-jar }}
+      run: |
+        # The client renders to Xvfb with Mesa software GL instead of the HeadlessMC -lwjgl no-op patch,
+        # which reports 0 vertex attributes and breaks renderers that ask the driver for its limits.
+        apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends procps xvfb xauth x11-xserver-utils \
+          libgl1 libglx-mesa0 libgl1-mesa-dri libxcursor1 libxrandr2 libxi6 libxxf86vm1 libxtst6 > /dev/null
+        mc="$RUNNER_TEMP/minecraft"
+        mkdir -p "$RUNNER_TEMP/dl" "$mc" client/mods
+        cd "$RUNNER_TEMP/dl"
+        curl -fsSLo neoforge-installer.jar "https://maven.neoforged.net/releases/net/neoforged/neoforge/$NEOFORGE/neoforge-$NEOFORGE-installer.jar"
+        curl -fsSLo mc-runtime-test.jar "$MCRT_URL"
+        echo "$NEOFORGE_SHA256  neoforge-installer.jar" | sha256sum -c
+        echo "$MCRT_SHA256  mc-runtime-test.jar" | sha256sum -c
+        # The installer refuses a directory without a launcher profile file.
+        echo '{"profiles":{}}' > "$mc/launcher_profiles.json"
+        java -jar neoforge-installer.jar --installClient "$mc"
+        cd "$GITHUB_WORKSPACE"
+        cp "$RUNNER_TEMP/dl/mc-runtime-test.jar" client/mods/
+        cp $MOD_JAR client/mods/
+        printf '%s\n' 'onboardAccessibility:false' 'pauseOnLostFocus:false' > client/options.txt
+        # FML 4.0.43 reloads fml.toml during mod discovery while the early loading screen thread reads it, so the screen can
+        # read a half-loaded config and throw a NullPointerException. The smoke test needs no loading screen, so turn it off.
+        mkdir -p client/config
+        echo 'earlyWindowControl = false' > client/config/fml.toml
+        mkdir -p HeadlessMC
+        printf '%s\n' \
+          "hmc.java.versions=$JAVA_HOME_21_X64/bin/java" \
+          'hmc.java.use.current=false' \
+          'hmc.auto.download.java=false' \
+          "hmc.gamedir=$GITHUB_WORKSPACE/client" \
+          "hmc.mcdir=$mc" \
+          'hmc.offline=true' \
+          'hmc.assets.dummy=true' \
+          'hmc.rethrow.launch.exceptions=true' \
+          'hmc.exit.on.failed.command=true' \
+          'hmc.jvmargs=-Xmx3G -Dmixin.debug.verify=true -Dmixin.debug.export=true -DMcRuntimeGameTest=false' \
+          > HeadlessMC/config.properties
+    # The jar is in the mods folder before the client starts, so a crash on mod load or on the first sky frame fails here.
+    - name: Start the client, open a single-player world, then quit
+      shell: bash
+      run: |
+        JAVA_HOME="$JAVA_HOME_21_X64" xvfb-run -a "$JAVA_HOME_21_X64/bin/java" -Dhmc.check.xvfb=true -jar /headlessmc/headlessmc-launcher-*.jar \
+          --command launch "neoforge-$NEOFORGE" 2>&1 | tee client.log
+    - name: Check the client log
+      shell: bash
+      run: |
+        grep -m1 -F 'java version 21' client.log
+        if grep -nE 'Mixin apply .*failed|InvalidMixinException|MixinApplyError|Mixin transformation of .* failed' client.log; then
+          echo 'A mixin failed to apply (lines above).'
+          exit 1
+        fi
+        crashes=$(ls client/crash-reports/*.txt 2>/dev/null || true)
+        if [ -n "$crashes" ]; then
+          echo 'The client wrote a crash report:'
+          cat $crashes
+          exit 1
+        fi
+        # The mod's constructor registers a client config, so the file exists only when the jar was discovered and loaded.
+        test -f client/config/stellarview-client.toml || { echo 'The mod config was never written, so the jar was not loaded.'; exit 1; }
+        grep -F 'Successfully finished.' client.log
+
+    # Runs even when an earlier step failed or timed out, so no game or X server outlives the job.
+    # The [x] brackets keep pkill from matching this step's own command line.
+    - name: Kill leftover game processes
+      if: ${{ always() }}
+      shell: bash
+      run: pkill -f '[h]eadlessmc|[X]vfb|[n]et.minecraft' || true
