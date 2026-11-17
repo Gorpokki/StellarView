@@ -85,9 +85,7 @@ jobs:
         if: ${{ steps.scoring.outputs.skip != 'true' }}
         id: qlty-check
         run: |
-          rc=0
-          qlty check --upstream "$BASE" --no-formatters --no-progress --fail-level medium --sarif > "$RUNNER_TEMP/qlty-check.sarif" || rc=$?
-          [ "$rc" -le 1 ] || exit "$rc"
+          qlty check --upstream "$BASE" --no-formatters --no-progress --level medium --no-fail --sarif > "$RUNNER_TEMP/qlty-check.sarif"
       - name: Gate lint findings on changed lines
         if: ${{ steps.scoring.outputs.skip != 'true' }}
         uses: Gorpokki/minecraft-mod-actions/sarif-changed-lines@fca1c54653822990b918578721acade3c732513b # v1.1.0
@@ -119,9 +117,7 @@ jobs:
         if: ${{ steps.scoring.outputs.skip != 'true' && !cancelled() && steps.changed-workflows.outputs.found == 'true' }}
         run: |
           mapfile -d '' -t files < "$RUNNER_TEMP/changed-workflows.txt"
-          rc=0
-          zizmor --no-progress --format sarif "${files[@]}" > "$RUNNER_TEMP/zizmor.sarif" || rc=$?
-          [ "$rc" -le 1 ] || exit "$rc"
+          zizmor --no-progress --format sarif "${files[@]}" > "$RUNNER_TEMP/zizmor.sarif"
       - name: Gate workflow findings on changed lines
         if: ${{ steps.scoring.outputs.skip != 'true' && !cancelled() && steps.zizmor.outcome == 'success' }}
         uses: Gorpokki/minecraft-mod-actions/sarif-changed-lines@fca1c54653822990b918578721acade3c732513b # v1.1.0
